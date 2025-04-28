@@ -176,14 +176,14 @@ updates.
 [documentation style guide]: https://github.com/kubernetes/community/blob/master/contributors/guide/style-guide.md
 -->
 
-Currently, the Kubernetes prohibits modifications to `spec.volumeClaimTemplates` of a `StatefulSet`. This KEP proposes enabling updates to this field and its associated `PersistentVolumeClaim (PVC)` objects.
+Currently, the to `spec.volumeClaimTemplates` field of `StatefulSet` cannot be modified. This KEP proposes enabling updates to this field and its associated `PersistentVolumeClaim (PVC)` objects.
 
 Specifically, the following types of modifications will be supported for each volume claim template object in `spec.volumeClaimTemplates`:
 
-1. Increasing the requested storage size (`spec.resources.requests.storage`).
-2. Modifying the Volume Attributes Class (VAC) used by the claim (`spec.volumeAttributesClassName`).
-3. Modifying volume claim template's labels (`metadata.labels`).
-4. Modifying volume claim template's annotations (`metadata.annotations`).
+1. Increasing the requested storage (`spec.resources.requests.storage`).
+2. Modifying the Volume Attributes Class (VAC) used by a claim (`spec.volumeAttributesClassName`).
+3. Modifying a claim's labels (`metadata.labels`).
+4. Modifying a claim's annotations (`metadata.annotations`).
 
 Additionally, the `StatefulSet` API will be extended to include the `spec.volumeClaimUpdatePolicy` field. This will be used to support different claim update strategies.
 
