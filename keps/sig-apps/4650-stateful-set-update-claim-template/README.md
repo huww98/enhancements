@@ -82,8 +82,7 @@ tags, and then generate with `hack/update-toc.sh`.
   - [What PVC is compatible](#what-pvc-is-compatible)
   - [User Stories (Optional)](#user-stories-optional)
     - [Story 1: Batch Expand Volumes](#story-1-batch-expand-volumes)
-    - [Story 2: Shinking the PV by Re-creating PVC](#story-2-shinking-the-pv-by-re-creating-pvc)
-    - [Story 3: Asymmetric Replicas](#story-3-asymmetric-replicas)
+    - [Story 2: Asymmetric Replicas](#story-2-asymmetric-replicas)
   - [Notes/Constraints/Caveats (Optional)](#notesconstraintscaveats-optional)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
@@ -177,12 +176,18 @@ updates.
 [documentation style guide]: https://github.com/kubernetes/community/blob/master/contributors/guide/style-guide.md
 -->
 
-Kubernetes does not support the modification of the `volumeClaimTemplates` of a StatefulSet currently.
-This enhancement proposes to support modifications to the `volumeClaimTemplates`,
-automatically patching the associated PersistentVolumeClaim objects if applicable.
-Currently, PVC `spec.resources.requests.storage`, `spec.volumeAttributesClassName`, `metadata.labels`, and `metadata.annotations`
-can be patched.
-All the updates to PersistentVolumeClaim can be coordinated with `Pod` updates
+Currently, the Kubernetes prohibits modifications to `spec.volumeClaimTemplates` of a `StatefulSet`. This KEP proposes enabling updates to this field and its associated `PersistentVolumeClaim (PVC)` objects.
+
+Specifically, the following types of modifications will be supported for each volume claim template object in `spec.volumeClaimTemplates`:
+
+1. Increasing the requested storage size (`spec.resources.requests.storage`).
+2. Modifying the Volume Attributes Class (VAC) used by the claim (`spec.volumeAttributesClassName`).
+3. Modifying volume claim template's labels (`metadata.labels`).
+4. Modifying volume claim template's annotations (`metadata.annotations`).
+
+Additionally, the `StatefulSet` API will be extended to include the `spec.volumeClaimUpdatePolicy` field. This will be used to support different claim update strategies.
+
+All the updates to `PersistentVolumeClaim` will be coordinated with Pod updates
 to honor any dependencies between them.
 
 ## Motivation
@@ -210,11 +215,13 @@ This brings many headaches in a continuously evolving environment.
 List the specific goals of the KEP. What is it trying to achieve? How will we
 know that this has succeeded?
 -->
-* Allow users to update some fields of `volumeClaimTemplates` of a `StatefulSet`.
-* Automatically patch the associated PersistentVolumeClaim objects, without interrupting the running Pods.
-* Support updating PersistentVolumeClaim objects with `OnDelete` strategy.
-* Coordinate updates to `Pod` and PersistentVolumeClaim objects.
-* Provide accurate status and error messages to users when the update fails.
+* Enable updates to the following field for each object in `volumeClaimTemplates` of a `StatefulSet`:
+  * `spec.resources.requests.storage`
+  * `spec.volumeAttributesClassName`
+  * `metadata.labels`
+  * `metadata.annotations`
+* Automatically patch the existing `PersistentVolumeClaim` objects, without interrupting the running Pods.
+* Add `spec.volumeClaimUpdatePolicy` to `StatefulSet` allowing users to decide how the volume claim will be updated: in-place or on PVC deletion.
 
 ### Non-Goals
 
@@ -238,15 +245,17 @@ implementation. What is the desired outcome and how do we measure success?.
 The "Design Details" section below is for the real
 nitty-gritty.
 -->
-1. Change API server to allow specific updates to `volumeClaimTemplates` of a StatefulSet:
+1. Change API server to allow specific updates to each object in `volumeClaimTemplates` of a StatefulSet:
    * `labels`
    * `annotations`
    * `resources.requests.storage`
    * `volumeAttributesClassName`
 
-2. Modify StatefulSet controller to add PVC reconciliation logic.
+2. Expand `StatefulSet` API to include `spec.volumeClaimUpdatePolicy`.
 
-3. Collect the status of managed PVCs, and show them in the StatefulSet status.
+3. Modify StatefulSet controller to:
+  * Handle PVC reconciliation logic.
+  * Collect the status of managed PVCs, and show them in the StatefulSet status.
 
 ### Kubernetes API Changes
 
@@ -367,19 +376,7 @@ To expand the volumes managed by a StatefulSet,
 we can just use the same pipeline that we are already using to update the Pod.
 All the test, review, approval, and rollback process can be reused.
 
-#### Story 2: Shinking the PV by Re-creating PVC
-
-After running our app for a while, we optimize the data layout and reduce the required storage size.
-Now we want to shrink the PVs to save cost.
-We can not afford any downtime, so we don't want to delete and recreate the StatefulSet.
-We also don't have the infrastructure to migrate between two StatefulSets.
-Our app can automatically rebuild the data in the new storage from other replicas.
-So we update the `volumeClaimTemplates` of the StatefulSet,
-delete the PVC and Pod of one replica, let the controller re-create them,
-then monitor the rebuild process.
-Once the rebuild completes successfully, we proceed to the next replica.
-
-#### Story 3: Asymmetric Replicas
+#### Story 2: Asymmetric Replicas
 
 The storage requirement of different replicas are not identical,
 so we still want to update each PVC manually and separately.
@@ -907,7 +904,7 @@ Describe them, providing:
   - Estimated amount of new objects: (e.g., new Object X for every existing Pod)
 -->
 StatefulSet:
-- `spec`: 2 new enum fields, ~10B
+- `spec`: 1 new enum fields, ~10B
 - `status`: 4 new integer fields, ~10B
 
 ###### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
@@ -1041,7 +1038,7 @@ This is just an extra validation in APIServer. We may remove it later if we find
 We propose to patch the PVC as a whole, so it can only succeed if the immutable fields matches.
 
 If only expansion is supported, patching regardless of the immutable fields can be a logical choice.
-But this KEP also integrates with VAC. VAC is closely coupled with storage class.
+But this KEP also integrates with Volume Attributes Class (VAC). VAC is closely coupled with storage class.
 Only patching VAC if storage class matches is a very logical choice.
 And we'd better follow the same operation model for all mutable fields.
 
