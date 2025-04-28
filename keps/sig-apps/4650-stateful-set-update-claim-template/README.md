@@ -245,44 +245,31 @@ implementation. What is the desired outcome and how do we measure success?.
 The "Design Details" section below is for the real
 nitty-gritty.
 -->
-1. Change API server to allow specific updates to each object in `volumeClaimTemplates` of a StatefulSet:
+
+### Kubernetes API Changes
+
+1. Change API server to allow updates to the following fields of each object in `volumeClaimTemplates` of a StatefulSet:
    * `labels`
    * `annotations`
    * `resources.requests.storage`
    * `volumeAttributesClassName`
 
-2. Expand `StatefulSet` API to include `spec.volumeClaimUpdatePolicy`.
+2. Expand `StatefulSet` `spec` to include `volumeClaimUpdatePolicy` field. This will be used to specify how to coordinate the updates of PVCs and Pods. Possible values are:
+    * `OnDelete`: the default value, only update the PVC when the the old PVC is deleted.
+    * `InPlace`: patch the PVC in-place if possible. Also includes the `OnDelete` behavior.
 
-3. Modify StatefulSet controller to:
-  * Handle PVC reconciliation logic.
-  * Collect the status of managed PVCs, and show them in the StatefulSet status.
+3. Extend to `StatefulSet` `status` to include the following information for each mangaged `PersistentVolumeClaim`:
+    - `compatible`: the number of PVCs that are compatible with the template.
+      These replicas will not be blocked on Pod recreation.
+    - `updating`: the number of PVCs that are being updated in-place (e.g. expansion in progress).
+    - `overSized`: the number of PVCs that are larger than the template.
+    - `totalCapacity`: the sum of `status.capacity` of all the PVCs.
 
-### Kubernetes API Changes
-
-Changes to StatefulSet `spec`:
-
-Introduce a new field in StatefulSet `spec`: `volumeClaimUpdatePolicy` to
-specify how to coordinate the update of PVCs and Pods. Possible values are:
-- `OnDelete`: the default value, only update the PVC when the the old PVC is deleted.
-- `InPlace`: patch the PVC in-place if possible. Also includes the `OnDelete` behavior.
-
-Changes to StatefultSet `status`:
-
-Additionally collect the status of managed PVCs, and show them in the StatefulSet status.
-
-For each PVC in the template:
-- compatible: the number of PVCs that are compatible with the template.
-  These replicas will not be blocked on Pod recreation.
-- updating: the number of PVCs that are being updated in-place (e.g. expansion in progress).
-- overSized: the number of PVCs that are larger than the template.
-- totalCapacity: the sum of `status.capacity` of all the PVCs.
-
-Some fields in the `status` are also updated to reflect the staus of the PVCs:
-- readyReplicas: in addition to pods, also consider the PVCs status. A PVC is not ready if:
-  - `volumeClaimUpdatePolicy` is `InPlace` and the PVC is updating;
-- availableReplicas: total number of replicas of which both Pod and PVCs are ready for at least `minReadySeconds`
-- currentRevision, updateRevision, currentReplicas, updatedReplicas
-  are updated to reflect the status of PVCs.
+4. Existing `status` fields will be updated to reflect the status of the PVCs:
+    - `readyReplicas`: in addition to pods, also consider the PVCs status. A PVC is not ready if:
+      - `volumeClaimUpdatePolicy` is `InPlace` and the PVC is updating;
+    - `availableReplicas`: total number of replicas of which both Pod and PVCs are ready for at least `minReadySeconds`
+    - `currentRevision`, `updateRevision`, `currentReplicas`, `updatedReplicas` will be updated to reflect the status of PVCs.
 
 With these changes, user can still use `kubectl rollout status` to monitor the update process,
 both for automated patching and for the PVCs that need manual intervention.
@@ -290,13 +277,10 @@ both for automated patching and for the PVCs that need manual intervention.
 ### Updated Reconciliation Logic
 
 How to update PVCs:
-1. If `volumeClaimUpdatePolicy` is `InPlace`,
-   and if `volumeClaimTemplates` and actual PVC only differ in mutable fields
-   (`spec.resources.requests.storage`, `spec.volumeAttributesClassName`, `metadata.labels`, and `metadata.annotations` currently),
-   patch the PVC to the extent possible.
+1. If `volumeClaimUpdatePolicy` is `InPlace` and if `volumeClaimTemplates` and actual PVC only differ in mutable fields (`spec.resources.requests.storage`, `spec.volumeAttributesClassName`, `metadata.labels`, and `metadata.annotations` currently), patch the PVC to the extent possible.
    - `spec.resources.requests.storage` is patched to max(template spec, PVC status)
-     - Do not decreasing the storage size below its current status.
-       Note that decrease the size in PVC spec can help recover from a failed expansion if 
+     - Do not decrease the storage size below its current status.
+       Note that decreasing the size in PVC spec can help recover from a failed expansion if 
        `RecoverVolumeExpansionFailure` feature gate is enabled.
    - `spec.volumeAttributesClassName` is patched to the template value.
    - `metadata.labels` and `metadata.annotations` are patched with server side apply.
