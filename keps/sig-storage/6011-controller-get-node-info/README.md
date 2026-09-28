@@ -85,7 +85,7 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 
 ## Summary
 
-This KEP introduces a new optional CSI RPC, `ControllerGetNodeInfo`, and a companion request flag on the existing `NodeGetInfo`, that together allow a CSI driver to split node registration into two phases: a lightweight node-side identity call and a controller-side lookup for topology and capacity. This eliminates the need for cloud API credentials on worker nodes while preserving full topology-aware scheduling and accurate volume limit tracking.
+This KEP introduces a new optional CSI RPC, `ControllerGetNodeInfo`, and a companion request flag on the existing `NodeGetInfo`, that together allow a CSI driver to split node registration into two phases: a lightweight node-side identity call and a controller-side lookup for topology and the volume attach limit. This eliminates the need for cloud API credentials on worker nodes while preserving full topology-aware scheduling and accurate volume limit tracking.
 
 ## Motivation
 
@@ -95,7 +95,7 @@ This creates several problems:
 
 1. **Security**: Organizations with strict security postures, particularly in financial services and government, prohibit distributing cloud API credentials to worker nodes. These users must choose between security and full CSI functionality.
 
-2. **Accuracy**: The scheduler only counts CSI volumes when enforcing `max_volumes_per_node`. Non-CSI attachments (boot volumes, manually attached disks, network interfaces consuming shared device slots) are invisible to it. So the SP must subtract non-CSI attachments from the instance-type limit before reporting `max_volumes_per_node`. The node side can only approximate this, using static configuration or stale metadata. The controller side can do it precisely, because it knows which volumes are CSI-managed (via `VolumeAttachment` objects) and can query the cloud for actual attachments.
+2. **Non-CSI attachments**: Boot volumes, manually attached disks, and network interfaces that share device slots are not counted by the scheduler, so the reported limit must exclude them. When the limit is computed on the controller side, the controller plugin sees every attachment through the cloud API, but only the CO knows which ones it published.
 
 3. **Scalability**: In large clusters, every node independently calls cloud APIs during registration. A 5000-node cluster startup produces 5000 concurrent API calls, risking throttling and slow registration. A controller-side approach enables batching, caching, and coordinated rate limiting.
 
@@ -126,7 +126,7 @@ A financial services company prohibits cloud API credentials on worker nodes. To
 
 #### Story 2: Accurate Non-CSI Volume Accounting
 
-An operator's nodes have boot volumes, manually attached disks, and network interfaces consuming shared device slots, none of which are managed by CSI. The scheduler doesn't know about these; it only counts CSI volumes. So the SP must subtract non-CSI attachments from the instance-type limit before reporting `max_volumes_per_node`. Today, some CSI drivers handle this with static configuration (e.g., AWS EBS CSI driver's `--reserved-volume-attachments`) or provider-specific sidecars (e.g., AWS EBS CSI driver's metadata-labeler). With this proposal, the controller queries actual cloud attachments, compares against `VolumeAttachment` objects to identify non-CSI volumes, and reports an accurate limit, dynamically, with no manual configuration.
+An operator's nodes have boot volumes, manually attached disks, and network interfaces consuming shared device slots, none of which are managed by CSI. The operator does not allow cloud API credentials on nodes (Story 1), so the limit comes from the controller plugin. The controller plugin sees these attachments through the cloud API, but it cannot tell them apart from volumes the CO published. Today, some CSI drivers handle this with static configuration (e.g., AWS EBS CSI driver's `--reserved-volume-attachments`) or provider-specific sidecars. With this proposal, the SP returns the volumes attached to the node, and external-attacher subtracts those without a `VolumeAttachment` from the SP's limit.
 
 #### Story 3: Large Cluster Scalability
 
@@ -140,6 +140,7 @@ A 5000-node cluster startup triggers 5000 concurrent cloud API calls from `NodeG
 | Controller becomes a bottleneck | The controller already handles `ControllerPublishVolume` for every attach. `ControllerGetNodeInfo` adds one call per node registration, which is negligible overhead. Batching and caching further reduce load. |
 | Race between `ControllerGetNodeInfo` and concurrent attach/detach | CO records volume IDs processed during the call and considers them CSI-managed. See [Race Condition Mitigation](#race-condition-mitigation). |
 | Version skew | Feature gates on kube-apiserver, kubelet, and external-attacher. See [Version Skew Strategy](#version-skew-strategy). |
+| Node-side limit overrides stop applying | In the controller-side flow, kubelet ignores limits reported by the node plugin. Deployments that set per-node limits with node plugin flags should keep using the existing `NodeGetInfo` flow. |
 
 ### Notes/Constraints/Caveats
 
@@ -148,6 +149,8 @@ A 5000-node cluster startup triggers 5000 concurrent cloud API calls from `NodeG
 - **Upgrade Order**: External-attacher must be upgraded before nodes. If external-attacher does not yet support `ControllerGetNodeInfo`, registrations without an existing `Spec.Drivers` entry remain pending. Existing entries with a matching node ID are preserved but cannot be refreshed through the controller-side flow until external-attacher catches up.
 
 - **Backward Compatibility**: Drivers that do not adopt the new flow continue to use `NodeGetInfo` unchanged. No breaking changes.
+
+- **Attachable Drivers Only**: The controller-side flow runs in external-attacher and relies on `VolumeAttachment` objects. Kubernetes supports it only for drivers with the `PUBLISH_UNPUBLISH_VOLUME` controller capability, which already deploy external-attacher. Cluster admins can keep the existing flow for any driver by disabling the `CSIControllerGetNodeInfo` feature gate on kubelet.
 
 ## Design Details
 
@@ -200,18 +203,28 @@ See [Alternative 6](#alternative-6-separate-nodegetid-rpc).
 rpc ControllerGetNodeInfo(ControllerGetNodeInfoRequest) returns (ControllerGetNodeInfoResponse) {
     option (alpha_method) = true;
 }
+
+message ControllerGetNodeInfoResponse {
+  option (alpha_message) = true;
+  // Volume attachment limit calculated by the SP. OPTIONAL.
+  int64 max_volumes_per_node = 1;
+  // Same semantics as NodeGetInfoResponse.accessible_topology. OPTIONAL.
+  Topology accessible_topology = 2;
+  // Volumes published to the node according to the SP, including
+  // volumes the CO did not publish (e.g. boot disks). OPTIONAL.
+  repeated string published_volume_ids = 3;
+}
 ```
 
 Retrieves topology, attached volumes, and instance limit from the controller side, where cloud API credentials are already available.
 
 **Input**: `node_id` (from `NodeGetInfo`)
-**Output**: `accessible_topology` (zone, region, etc.), `max_volumes_per_node` (volume attachment limit calculated by SP), `published_volume_ids` (volumes attached according to cloud API)
 
 **Design: volume classification**. The scheduler treats `allocatable.count` in `CSINode` as the number of CSI-managed volumes the node can support, then subtracts the CSI volumes it already knows about to determine available slots. The scheduler has no awareness of non-CSI attachments (boot volumes, network interfaces consuming shared device slots, manually attached disks). So non-CSI volumes must be accounted for.
 
 Today, CSI drivers handle this on the node side with approximations. For example, the AWS EBS CSI driver computes `instance_limit - reserved_attachments - ENIs` (see [`getVolumesLimit()`](https://github.com/kubernetes-sigs/aws-ebs-csi-driver/blob/master/pkg/driver/node.go)), using static configuration (`--reserved-volume-attachments`) or metadata heuristics. But the node side cannot dynamically distinguish CSI-managed from non-CSI attachments.
 
-The CO has the `VolumeAttachment` context needed to classify volumes, while the SP only has cloud API results. The SP calculates the volume attachment limit (accounting for ENIs etc.) and reports the attached volumes. The CO identifies non-CSI volumes from the attachment list and subtracts them:
+The CO has the `VolumeAttachment` context needed to classify volumes, while the SP only has cloud API results. The SP calculates the volume attachment limit (accounting for ENIs etc.) and reports the attached volumes. External-attacher subtracts the non-CSI volumes from the SP's limit and writes the result to `CSINode.Spec.Drivers[*].Allocatable.Count`. The scheduler does not change. The calculation is:
 
 ```
 volume_limit     = max_volumes_per_node (SP calculated, accounting for ENIs etc.)
@@ -222,6 +235,8 @@ effective_limit  = volume_limit - non_csi_attached
 ```
 
 **Example**: Instance type limit is 25. Node has 2 ENIs (consuming 2 slots on shared-limit types). SP calculates attachment limit = 23. Cloud API shows 10 attached volumes (`published_volume_ids`). CO has 8 CSI volumes in `VolumeAttachment`. CO identifies 2 non-CSI volumes (boot volume + manually attached disk) → effective limit = 23 - 2 = 21. Scheduler subtracts 8 CSI volumes → 13 available. Correct: 25 - 2 (ENIs) - 10 (attached) = 13 real remaining.
+
+If the SP omits `published_volume_ids`, external-attacher uses `max_volumes_per_node` as returned.
 
 CO avoids a race condition by recording all volume IDs processed during the `ControllerGetNodeInfo` call and considers them CSI-managed.
 
@@ -275,7 +290,7 @@ When the driver unregisters, kubelet removes both its `DriverRegistrations` entr
 
 #### external-attacher Changes
 
-When the `CSIControllerGetNodeInfo` feature gate is enabled, `CSINode.Spec.DriverRegistrations` has an entry for the driver, and the CSI controller plugin advertises `GET_NODE_INFO`:
+When the `CSIControllerGetNodeInfo` feature gate is enabled, `CSINode.Spec.DriverRegistrations` has an entry for the driver, and the CSI controller plugin advertises both `PUBLISH_UNPUBLISH_VOLUME` and `GET_NODE_INFO`:
 
 1. Call `ControllerGetNodeInfo` when the driver has a `DriverRegistrations` entry but no `CSINode.Spec.Drivers` entry (initial registration)
 2. Call `ControllerGetNodeInfo` after `ControllerPublishVolume` returns `RESOURCE_EXHAUSTED` if `CSIDriver.Spec.NodeAllocatableUpdatePeriodSeconds` is set (capacity correction, building on KEP-4876)
@@ -367,7 +382,7 @@ func (h *csiHandler) syncAttach(va) {
 
 When classifying volumes, the CO considers any volume ID processed during the `ControllerGetNodeInfo` call as CSI-managed.
 
-This approach handles all edge cases:
+This covers CSI volumes in each of these states:
 - volumes that have `VolumeAttachment` before the call, including those with uncertain status (in-progress or failed attaches)
 - volumes attached during the call,
 - volumes detached during the call,
@@ -376,6 +391,7 @@ This approach handles all edge cases:
 All are correctly classified as CSI-managed.
 We never misclassify CSI as non-CSI, assuming SP will not return any successfully unpublished volumes in subsequent `ControllerGetNodeInfo` calls.
 Over-counting already detached CSI volume is safe, this will not affect non-CSI volume count.
+Non-CSI attachments that change after the cloud API query are not counted until the next refresh. As with KEP-4876, the limit is best-effort.
 
 #### Workflow
 
